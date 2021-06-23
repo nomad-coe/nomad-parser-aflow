@@ -44,9 +44,12 @@ class AELParser(TextParser):
             'pughs_modulus_ratio', 'debye_temperature', 'applied_pressure',
             'average_external_pressure'
         ]
-        unit = None
+        self._quantities = []
         for quantity in ael_quantities:
-            if 'modulus' in quantity or 'pressure' in quantity:
+            unit = None
+            if 'ratio' in quantity:
+                unit = None
+            elif 'modulus' in quantity or 'pressure' in quantity:
                 unit = ureg.GPa
             elif 'speed' in quantity:
                 unit = ureg.m / ureg.s
@@ -59,14 +62,14 @@ class AELParser(TextParser):
             Quantity(
                 'stiffness_tensor',
                 r'\[AEL\_STIFFNESS\_TENSOR\]START([\-\d\.\s]+)\[AEL\_STIFFNESS\_TENSOR\]STOP',
-                dtype=np.dtype(np.float64), unit='GPa')
+                dtype=np.dtype(np.float64), unit='GPa', shape=(6, 6))
         )
 
         self._quantities.append(
             Quantity(
                 'compliance_tensor',
                 r'\[AEL\_COMPLIANCE\_TENSOR\]START([\-\d\.\s]+?)\[AEL\_COMPLIANCE\_TENSOR\]STOP',
-                dtype=np.dtype(np.float64))
+                dtype=np.dtype(np.float64), shape=(6, 6))
         )
 
 
@@ -95,7 +98,7 @@ class AFLOWParser(FairdiParser):
             name='parsers/aflow', code_name='aflow',
             code_homepage='http://www.aflowlib.org/',
             mainfile_contents_re=r'\[AFLOW\] \*{50}',
-            mainfile_name_re=(r'.*/aflowlib\.json$')
+            mainfile_name_re=(r'.*/aflow\.a(?:e|g)l\.out$')
         )
         self.ael_parser = AELParser()
         self.agl_parser = AGLParser()
@@ -104,35 +107,40 @@ class AFLOWParser(FairdiParser):
         self._metainfo_map = {
             'stiffness_tensor': 'elastic_constants_matrix_second_order',
             'compliance_tensor': 'compliance_matrix_second_order',
-            'poisson_ratio': 'Poisson_ratio_Hill',
-            'bulk_modulus_voigt': 'bulk_modulus_Voigt',
-            'bulk_modulus_reuss': 'bulk_modulus_Reuss',
-            'shear_modulus_voigt': 'shear_modulus_Voigt',
-            'shear_modulus_reuss': 'shear_modulus_Reuss',
-            'bulk_modulus_vrh': 'bulk_modulus_Hill',
-            'shear_modulus_vrh': 'shear_modulus_Hill',
-            'youngs_modulus_vrh': 'Young_modulus_Hill',
-            'pughs_modulus_ratio': 'pugh_ratio_hill', 'applied_pressure': 'pressure',
-            'average_external_pressure': 'x_aflow_average_external_pressure'
+            'poisson_ratio': 'poisson_ratio_hill',
+            'bulk_modulus_vrh': 'bulk_modulus_hill',
+            'shear_modulus_vrh': 'shear_modulus_hill',
+            'youngs_modulus_vrh': 'Young_modulus_hill',
+            'pughs_modulus_ratio': 'pugh_ratio_hill', 'applied_pressure': 'x_aflow_ael_applied_pressure',
+            'average_external_pressure': 'x_aflow_ael_average_external_pressure'
         }
 
     def init_parser(self):
-        self.ael_parser.mainfile = os.path.join(self.maindir, 'aflow.ael.out')
-        self.ael_parser.logger = self.logger
-        self.agl_parser.mainfile = os.path.join(self.maindir, 'aflow.agl.out')
-        self.agl_parser.logger = self.logger
+        self.ael_parser.mainfile = None
+        self.agl_parser.mainfile = None
+        if self.filepath.endswith('aflow.ael.out'):
+            self.ael_parser.mainfile = self.filepath
+            self.ael_parser.logger = self.logger
+        elif self.filepath.endswith('aflow.agl.out'):
+            self.agl_parser.mainfile = self.filepath
+            self.agl_parser.logger = self.logger
 
     def parse_agl(self):
+        if self.agl_parser.mainfile is None:
+            return
+
         thermal_properties = self.agl_parser.get('thermal_properties')
         if thermal_properties is None:
             return
 
-        sec_workflow = self.archive.section_workflow
-        sec_workflow = sec_workflow if sec_workflow else self.archive.m_create(Workflow)
+        sec_workflow = self.archive.m_create(Workflow)
+        sec_workflow.workflow_type = 'debye_model'
         sec_debye = sec_workflow.m_create(DebyeModel)
 
+        thermal_properties = np.reshape(thermal_properties, (len(thermal_properties) // 9, 9))
         thermal_properties = np.transpose(thermal_properties)
         energies = self.agl_parser.get('energies')
+        energies = np.reshape(energies, (len(energies) // 9, 9))
         energies = np.transpose(energies)
 
         sec_debye.temperatures = thermal_properties[0] * ureg.K
@@ -150,10 +158,23 @@ class AFLOWParser(FairdiParser):
         sec_debye.entropy_vibrational = energies[4] * ureg.meV / ureg.K
 
     def parse_ael(self):
+        if self.ael_parser.mainfile is None:
+            return
+
         sec_workflow = self.archive.m_create(Workflow)
-        # TODO should workflow be repeating, if not, workflow types can mix in a workflow
-        # sec_workflow.workflow_type = 'elastic'
+        sec_workflow.workflow_type = 'elastic'
         sec_elastic = sec_workflow.m_create(Elastic)
+        sec_elastic.energy_stress_calculator = 'vasp'
+        sec_elastic.calculation_method = 'stress'
+        sec_elastic.elastic_constants_order = 2
+
+        paths = [d for d in self.aflow_data.get('files', []) if d.startswith('ARUN.AEL')]
+        deforms = np.array([d.split('_')[-2:] for d in paths], dtype=np.dtype(np.float64))
+        strains = [d[1] for d in deforms if d[0] == 1]
+        sec_elastic.n_deformations = int(max(np.transpose(deforms)[0]))
+        sec_elastic.n_strains = len(strains)
+        sec_elastic.strain_maximum = max(strains) - 1.0
+
         for key, val in self.ael_parser.items():
             if val is None:
                 continue
@@ -169,16 +190,19 @@ class AFLOWParser(FairdiParser):
         self.init_parser()
 
         # load the aflow metadata from aflowlib.json
-        aflow_data = json.load(open(self.filepath))
+        try:
+            self.aflow_data = json.load(open(os.path.join(self.maindir, 'aflowlib.json')))
+        except Exception:
+            self.aflow_data = dict()
 
         sec_run = self.archive.m_create(Run)
         sec_run.program_name = 'aflow'
-        sec_run.program_version = aflow_data.get('aflow_version', 'unknown')
+        sec_run.program_version = self.aflow_data.get('aflow_version', 'unknown')
 
         # parse run metadata
         run_quantities = ['aurl', 'auid', 'data_api', 'data_source', 'loop']
         for key in run_quantities:
-            val = aflow_data.get(val)
+            val = self.aflow_data.get(key)
             if val is not None:
                 setattr(sec_run, 'x_aflow_%s' % key, val)
 
@@ -188,16 +212,17 @@ class AFLOWParser(FairdiParser):
         # in ARUN.AEL_*
         # parse structure from aflow_data
         sec_system = sec_run.m_create(System)
-        lattice_parameters = aflow_data.get('geometry')
+        lattice_parameters = self.aflow_data.get('geometry')
         if lattice_parameters is not None:
             cell = Cell.fromcellpar(lattice_parameters)
-            sec_system.lattice_vectors = np.array(cell) * ureg.angstrom
-        species = aflow_data.get('species', [])
+            sec_system.lattice_vectors = cell.array * ureg.angstrom
+            sec_system.configuration_periodic_dimensions = [True, True, True]
+        species = self.aflow_data.get('species', [])
         atom_labels = []
         for n, specie in enumerate(species):
-            atom_labels += [specie] * aflow_data['composition'][n]
+            atom_labels += [specie] * self.aflow_data['composition'][n]
         sec_system.atom_labels = atom_labels
-        sec_system.atom_positions = aflow_data.get('positions_cartesian') * ureg.angstrom
+        sec_system.atom_positions = self.aflow_data.get('positions_cartesian', []) * ureg.angstrom
 
         # parse system metadata from aflow_data
         system_quantities = [
@@ -229,11 +254,11 @@ class AFLOWParser(FairdiParser):
             'prototype_params_list_orig', 'prototype_params_values_orig', 'prototype_label_relax',
             'prototype_params_list_relax', 'prototype_params_values_relax']
         for key in system_quantities:
-            val = aflow_data.get(key)
+            val = self.aflow_data.get(key)
             if val is not None:
                 setattr(sec_system, 'x_aflow_%s' % key, val)
 
-        # parse method metadata from aflow_data
+        # parse method metadata from self.aflow_data
         method_quantities = [
             'code', 'species_pp', 'n_dft_type', 'dft_type', 'dft_type', 'species_pp_version',
             'species_pp_ZVAL', 'species_pp_AUID', 'ldau_type', 'ldau_l', 'ldau_u', 'ldau_j',
@@ -243,17 +268,22 @@ class AFLOWParser(FairdiParser):
             'kpoints_bands_nkpts']
         sec_method = sec_run.m_create(Method)
         for key in method_quantities:
-            val = aflow_data.get(key)
+            val = self.aflow_data.get(key)
             if val is not None:
                 setattr(sec_method, 'x_aflow_%s' % key, val)
 
-        # parse basic calculation quantities from aflow_data
+        # parse basic calculation quantities from self.aflow_data
         sec_scc = sec_run.m_create(SingleConfigurationCalculation)
-        sec_scc.energy_total = aflow_data['energy_cell'] * ureg.eV
-        sec_scc.atom_forces = aflow_data['forces'] * ureg.eV / ureg.angstrom
-        sec_scc.enthalpy = aflow_data['enthalpy_cell'] * ureg.eV
-        sec_scc.entropy = aflow_data['eentropy_cell'] * ureg.eV / ureg.K
-        sec_scc.time_calculation = aflow_data['calculation_time'] * ureg.s
+        if self.aflow_data.get('energy_cell') is not None:
+            sec_scc.energy_total = self.aflow_data['energy_cell'] * ureg.eV
+        if self.aflow_data.get('forces') is not None:
+            sec_scc.atom_forces = self.aflow_data['forces'] * ureg.eV / ureg.angstrom
+        if self.aflow_data.get('enthalpy_cell') is not None:
+            sec_scc.enthalpy = self.aflow_data['enthalpy_cell'] * ureg.eV
+        if self.aflow_data.get('entropy_cell') is not None:
+            sec_scc.entropy = self.aflow_data['entropy_cell'] * ureg.eV / ureg.K
+        if self.aflow_data.get('calculation_time') is not None:
+            sec_scc.time_calculation = self.aflow_data['calculation_time'] * ureg.s
         calculation_quantities = [
             'stress_tensor', 'pressure_residual', 'Pulay_stress', 'Egap', 'Egap_fit', 'Egap_type',
             'enthalpy_formation_cell', 'entropic_temperature', 'PV', 'spin_cell', 'spinD',
@@ -273,7 +303,7 @@ class AFLOWParser(FairdiParser):
             'node_CPU_Cores', 'node_CPU_MHz', 'node_RAM_GB', 'catalog', 'aflowlib_version',
             'aflowlib_date']
         for key in calculation_quantities:
-            val = aflow_data.get(key)
+            val = self.aflow_data.get(key)
             if val is not None:
                 setattr(sec_scc, 'x_aflow_%s' % key, val)
 

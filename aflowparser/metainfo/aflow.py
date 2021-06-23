@@ -22,7 +22,6 @@ from nomad.metainfo import (  # pylint: disable=unused-import
     MSection, MCategory, Category, Package, Quantity, Section, SubSection, SectionProxy,
     Reference
 )
-from nomad.metainfo.legacy import LegacyDefinition
 
 from nomad.datamodel.metainfo import common_dft
 
@@ -510,7 +509,7 @@ class System(common_dft.System):
         ''')
 
     x_aflow_Wyckoff_letters_orig = Quantity(
-        type=str,
+        type=np.dtype('U'),
         shape=['x_aflow_nspecies', 1],
         description='''
         ''')
@@ -522,7 +521,7 @@ class System(common_dft.System):
         ''')
 
     x_aflow_Wyckoff_site_symmetries_orig = Quantity(
-        type=str,
+        type=np.dtype('U'),
         shape=['x_aflow_nspecies', 1],
         description='''
         ''')
@@ -648,7 +647,7 @@ class System(common_dft.System):
         ''')
 
     x_aflow_Wyckoff_letters = Quantity(
-        type=str,
+        type=np.dtype('U'),
         shape=['x_aflow_nspecies', 1],
         description='''
         ''')
@@ -660,7 +659,7 @@ class System(common_dft.System):
         ''')
 
     x_aflow_Wyckoff_site_symmetries = Quantity(
-        type=str,
+        type=np.dtype('U'),
         shape=['x_aflow_nspecies', 1],
         description='''
         ''')
@@ -852,7 +851,7 @@ class SingleConfigurationCalculation(common_dft.SingleConfigurationCalculation):
         ''')
 
     x_aflow_agl_poisson_ratio_source = Quantity(
-        type=np.dtype(np.float64),
+        type=str,
         shape=[],
         description='''
         ''')

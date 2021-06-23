@@ -19,7 +19,7 @@
 import pytest
 
 from nomad.datamodel import EntryArchive
-from aflowparser import AflowParser
+from aflowparser import AFLOWParser
 
 
 def approx(value, abs=0, rel=1e-6):
@@ -28,11 +28,34 @@ def approx(value, abs=0, rel=1e-6):
 
 @pytest.fixture(scope='module')
 def parser():
-    return AflowParser()
+    return AFLOWParser()
 
 
-def test_basic(parser):
+def test_ael(parser):
     archive = EntryArchive()
-    parser.parse('tests/data/Ag1Co1O2_ICSD_246157/aflowlib.json', archive, None)
+    parser.parse('tests/data/Ag1Co1O2_ICSD_246157/aflow.ael.out', archive, None)
 
     assert archive.section_run[0].program_version == 'aflow30847'
+    assert archive.section_workflow.workflow_type == 'elastic'
+    sec_elastic = archive.section_workflow.section_elastic
+
+    assert sec_elastic.n_deformations == 3
+    assert sec_elastic.strain_maximum == pytest.approx(0.01)
+    assert sec_elastic.n_strains == 8
+    assert sec_elastic.elastic_constants_matrix_second_order[0][1].magnitude == approx(7.45333e+10)
+    assert sec_elastic.bulk_modulus_voigt.magnitude == approx(1.50939e+11)
+    assert sec_elastic.pugh_ratio_hill == approx(0.298965)
+
+
+def test_agl(parser):
+    archive = EntryArchive()
+    parser.parse('tests/data/Ag1Co1O2_ICSD_246157/aflow.agl.out', archive, None)
+
+    assert archive.section_workflow.workflow_type == 'debye_model'
+    sec_debye = archive.section_workflow.section_debye_model
+
+    assert sec_debye.temperatures[12].magnitude == 120
+    assert sec_debye.thermal_conductivity[18].magnitude == approx(4.924586)
+    assert sec_debye.gruneisen_parameter[35] == approx(2.255801)
+    assert sec_debye.heat_capacity_C_p[87].magnitude == approx(3.73438425e-22)
+    assert sec_debye.free_energy_vibrational[93].magnitude == approx(-4.13010555e-19)
