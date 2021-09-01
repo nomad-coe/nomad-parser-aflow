@@ -25,8 +25,14 @@ from ase.cell import Cell
 from nomad.units import ureg
 from nomad.parsing import FairdiParser
 from nomad.parsing.file_parser import TextParser, Quantity
-from nomad.datamodel.metainfo.common_dft import Run, SingleConfigurationCalculation,\
-    Method, System, Workflow, DebyeModel, Elastic
+from nomad.datamodel.metainfo.simulation.run import Run, Program
+from nomad.datamodel.metainfo.simulation.calculation import (
+    Calculation, Energy, EnergyEntry, Forces, ForcesEntry, Thermodynamics)
+from nomad.datamodel.metainfo.simulation.method import Method
+from nomad.datamodel.metainfo.simulation.system import System, Atoms
+from nomad.datamodel.metainfo.workflow import (
+    Workflow, Elastic, DebyeModel, Thermodynamics as WorkflowThermodynamics)
+
 
 from .metainfo import m_env
 
@@ -134,8 +140,9 @@ class AFLOWParser(FairdiParser):
             return
 
         sec_workflow = self.archive.m_create(Workflow)
-        sec_workflow.workflow_type = 'debye_model'
+        sec_workflow.type = 'debye_model'
         sec_debye = sec_workflow.m_create(DebyeModel)
+        sec_thermo = sec_workflow.m_create(WorkflowThermodynamics)
 
         thermal_properties = np.reshape(thermal_properties, (len(thermal_properties) // 9, 9))
         thermal_properties = np.transpose(thermal_properties)
@@ -143,26 +150,26 @@ class AFLOWParser(FairdiParser):
         energies = np.reshape(energies, (len(energies) // 9, 9))
         energies = np.transpose(energies)
 
-        sec_debye.temperatures = thermal_properties[0] * ureg.K
+        sec_thermo.temperatures = thermal_properties[0] * ureg.K
+        sec_thermo.gibbs_free_energy = energies[1] * ureg.eV
+        sec_thermo.vibrational_free_energy = energies[2] * ureg.meV
+        sec_thermo.vibrational_internal_energy = energies[3] * ureg.meV
+        sec_thermo.vibrational_entropy = energies[4] * ureg.meV / ureg.K
+        sec_thermo.heat_capacity_c_v = thermal_properties[4] * ureg.boltzmann_constant
+        sec_thermo.heat_capacity_c_p = thermal_properties[5] * ureg.boltzmann_constant
         sec_debye.thermal_conductivity = thermal_properties[1] * ureg.watt / ureg.m * ureg.K
         sec_debye.debye_temperature = thermal_properties[2] * ureg.K
         sec_debye.gruneisen_parameter = thermal_properties[3]
-        sec_debye.heat_capacity_C_v = thermal_properties[4] * ureg.boltzmann_constant
-        sec_debye.heat_capacity_C_p = thermal_properties[5] * ureg.boltzmann_constant
         sec_debye.thermal_expansion = thermal_properties[6] / ureg.K
         sec_debye.bulk_modulus_static = thermal_properties[7] * ureg.GPa
         sec_debye.bulk_modulus_isothermal = thermal_properties[8] * ureg.GPa
-        sec_debye.free_energy_gibbs = energies[1] * ureg.eV
-        sec_debye.free_energy_vibrational = energies[2] * ureg.meV
-        sec_debye.internal_energy_vibrational = energies[3] * ureg.meV
-        sec_debye.entropy_vibrational = energies[4] * ureg.meV / ureg.K
 
     def parse_ael(self):
         if self.ael_parser.mainfile is None:
             return
 
         sec_workflow = self.archive.m_create(Workflow)
-        sec_workflow.workflow_type = 'elastic'
+        sec_workflow.type = 'elastic'
         sec_elastic = sec_workflow.m_create(Elastic)
         sec_elastic.energy_stress_calculator = 'vasp'
         sec_elastic.calculation_method = 'stress'
@@ -196,8 +203,8 @@ class AFLOWParser(FairdiParser):
             self.aflow_data = dict()
 
         sec_run = self.archive.m_create(Run)
-        sec_run.program_name = 'aflow'
-        sec_run.program_version = self.aflow_data.get('aflow_version', 'unknown')
+        sec_run.program = Program(
+            name='aflow', version=self.aflow_data.get('aflow_version', 'unknown'))
 
         # parse run metadata
         run_quantities = ['aurl', 'auid', 'data_api', 'data_source', 'loop']
@@ -212,17 +219,18 @@ class AFLOWParser(FairdiParser):
         # in ARUN.AEL_*
         # parse structure from aflow_data
         sec_system = sec_run.m_create(System)
+        sec_system.atoms = Atoms()
         lattice_parameters = self.aflow_data.get('geometry')
         if lattice_parameters is not None:
             cell = Cell.fromcellpar(lattice_parameters)
-            sec_system.lattice_vectors = cell.array * ureg.angstrom
-            sec_system.configuration_periodic_dimensions = [True, True, True]
+            sec_system.atoms.lattice_vectors = cell.array * ureg.angstrom
+            sec_system.atoms.periodic = [True, True, True]
         species = self.aflow_data.get('species', [])
         atom_labels = []
         for n, specie in enumerate(species):
             atom_labels += [specie] * self.aflow_data['composition'][n]
-        sec_system.atom_labels = atom_labels
-        sec_system.atom_positions = self.aflow_data.get('positions_cartesian', []) * ureg.angstrom
+        sec_system.atoms.labels = atom_labels
+        sec_system.atoms.positions = self.aflow_data.get('positions_cartesian', []) * ureg.angstrom
 
         # parse system metadata from aflow_data
         system_quantities = [
@@ -273,13 +281,16 @@ class AFLOWParser(FairdiParser):
                 setattr(sec_method, 'x_aflow_%s' % key, val)
 
         # parse basic calculation quantities from self.aflow_data
-        sec_scc = sec_run.m_create(SingleConfigurationCalculation)
+        sec_scc = sec_run.m_create(Calculation)
+        sec_scc.energy = Energy()
+        sec_scc.forces = Forces()
+        sec_thermo = sec_scc.m_create(Thermodynamics)
         if self.aflow_data.get('energy_cell') is not None:
-            sec_scc.energy_total = self.aflow_data['energy_cell'] * ureg.eV
+            sec_scc.energy.total = EnergyEntry(value=self.aflow_data['energy_cell'] * ureg.eV)
         if self.aflow_data.get('forces') is not None:
-            sec_scc.atom_forces = self.aflow_data['forces'] * ureg.eV / ureg.angstrom
+            sec_scc.forces.total = ForcesEntry(value=self.aflow_data['forces'] * ureg.eV / ureg.angstrom)
         if self.aflow_data.get('enthalpy_cell') is not None:
-            sec_scc.enthalpy = self.aflow_data['enthalpy_cell'] * ureg.eV
+            sec_thermo.enthalpy = self.aflow_data['enthalpy_cell'] * ureg.eV
         if self.aflow_data.get('entropy_cell') is not None:
             sec_scc.entropy = self.aflow_data['entropy_cell'] * ureg.eV / ureg.K
         if self.aflow_data.get('calculation_time') is not None:

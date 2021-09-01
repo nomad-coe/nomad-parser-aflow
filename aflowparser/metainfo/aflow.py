@@ -23,10 +23,13 @@ from nomad.metainfo import (  # pylint: disable=unused-import
     Reference
 )
 
-from nomad.datamodel.metainfo import common_dft
+from nomad.datamodel.metainfo import simulation
 
 
-class Run(common_dft.Run):
+m_package = Package()
+
+
+class Run(simulation.run.Run):
 
     m_def = Section(validate=False, extends_base_section=True)
 
@@ -67,7 +70,7 @@ class Run(common_dft.Run):
         ''')
 
 
-class Method(common_dft.Method):
+class Method(simulation.method.Method):
 
     m_def = Section(validate=False, extends_base_section=True)
 
@@ -204,7 +207,7 @@ class Method(common_dft.Method):
         ''')
 
 
-class System(common_dft.System):
+class System(simulation.system.System):
 
     m_def = Section(validate=False, extends_base_section=True)
 
@@ -701,7 +704,7 @@ class System(common_dft.System):
         ''')
 
 
-class SingleConfigurationCalculation(common_dft.SingleConfigurationCalculation):
+class Calculation(simulation.calculation.Calculation):
 
     m_def = Section(validate=False, extends_base_section=True)
 

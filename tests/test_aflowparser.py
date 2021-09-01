@@ -35,9 +35,9 @@ def test_ael(parser):
     archive = EntryArchive()
     parser.parse('tests/data/Ag1Co1O2_ICSD_246157/aflow.ael.out', archive, None)
 
-    assert archive.section_run[0].program_version == 'aflow30847'
-    assert archive.section_workflow.workflow_type == 'elastic'
-    sec_elastic = archive.section_workflow.section_elastic
+    assert archive.run[0].program.version == 'aflow30847'
+    assert archive.workflow[0].type == 'elastic'
+    sec_elastic = archive.workflow[0].elastic
 
     assert sec_elastic.n_deformations == 3
     assert sec_elastic.strain_maximum == pytest.approx(0.01)
@@ -51,11 +51,12 @@ def test_agl(parser):
     archive = EntryArchive()
     parser.parse('tests/data/Ag1Co1O2_ICSD_246157/aflow.agl.out', archive, None)
 
-    assert archive.section_workflow.workflow_type == 'debye_model'
-    sec_debye = archive.section_workflow.section_debye_model
+    assert archive.workflow[0].type == 'debye_model'
+    sec_debye = archive.workflow[0].debye_model
+    sec_thermo = archive.workflow[0].thermodynamics
 
-    assert sec_debye.temperatures[12].magnitude == 120
+    assert sec_thermo.temperatures[12].magnitude == 120
     assert sec_debye.thermal_conductivity[18].magnitude == approx(4.924586)
     assert sec_debye.gruneisen_parameter[35] == approx(2.255801)
-    assert sec_debye.heat_capacity_C_p[87].magnitude == approx(3.73438425e-22)
-    assert sec_debye.free_energy_vibrational[93].magnitude == approx(-4.13010555e-19)
+    assert sec_thermo.heat_capacity_c_p[87].magnitude == approx(3.73438425e-22)
+    assert sec_thermo.vibrational_free_energy[93].magnitude == approx(-4.13010555e-19)

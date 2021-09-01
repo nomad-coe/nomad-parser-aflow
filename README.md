@@ -83,8 +83,8 @@ pip install nomad-lab
 Clone the parser project and install it in development mode:
 
 ```
-git clone https://github.com/nomad-coe/nomad-parser-abinit.git nomad-parser-abinit
-pip install -e nomad-parser-abinit
+git clone https://github.com/nomad-coe/nomad-parser-aflow.git nomad-parser-aflow
+pip install -e nomad-parser-aflow
 ```
 
 Running the parser now, will use the parser's Python code from the clone project.
