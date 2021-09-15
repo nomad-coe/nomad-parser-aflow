@@ -20,94 +20,139 @@ import os
 import numpy as np
 import logging
 import json
+from io import StringIO
 from ase.cell import Cell
+from ase.io import vasp
 
 from nomad.units import ureg
 from nomad.parsing import FairdiParser
 from nomad.parsing.file_parser import TextParser, Quantity
 from nomad.datamodel.metainfo.simulation.run import Run, Program
 from nomad.datamodel.metainfo.simulation.calculation import (
-    Calculation, Energy, EnergyEntry, Forces, ForcesEntry, Thermodynamics)
+    Calculation, Energy, EnergyEntry, Forces, ForcesEntry, Stress, StressEntry,
+    Thermodynamics, Dos, DosValues, BandStructure, BandEnergies)
 from nomad.datamodel.metainfo.simulation.method import Method
 from nomad.datamodel.metainfo.simulation.system import System, Atoms
 from nomad.datamodel.metainfo.workflow import (
-    Workflow, Elastic, DebyeModel, Thermodynamics as WorkflowThermodynamics)
+    Workflow, Elastic, DebyeModel, Phonon, Thermodynamics as WorkflowThermodynamics)
 
 
 from .metainfo import m_env
 
 
-class AELParser(TextParser):
+class AflowOutParser(TextParser):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def init_quantities(self):
-        ael_quantities = [
-            'poisson_ratio', 'bulk_modulus_voigt', 'bulk_modulus_reuss',
-            'shear_modulus_voigt', 'shear_modulus_reuss', 'bulk_modulus_vrh',
-            'shear_modulus_vrh', 'elastic_anisotropy', 'youngs_modulus_vrh',
-            'speed_sound_transverse', 'speed_sound_longitudinal', 'speed_sound_average',
-            'pughs_modulus_ratio', 'debye_temperature', 'applied_pressure',
-            'average_external_pressure'
-        ]
-        self._quantities = []
-        for quantity in ael_quantities:
-            unit = None
-            if 'ratio' in quantity:
-                unit = None
-            elif 'modulus' in quantity or 'pressure' in quantity:
-                unit = ureg.GPa
-            elif 'speed' in quantity:
-                unit = ureg.m / ureg.s
-            elif 'temperature' in quantity:
-                unit = ureg.K
-            self._quantities.append(Quantity(
-                quantity, r'ael\_%s=(\S+)' % quantity, dtype=np.float64, unit=unit))
 
-        self._quantities.append(
-            Quantity(
-                'stiffness_tensor',
-                r'\[AEL\_STIFFNESS\_TENSOR\]START([\-\d\.\s]+)\[AEL\_STIFFNESS\_TENSOR\]STOP',
-                dtype=np.dtype(np.float64), unit='GPa', shape=(6, 6))
-        )
+        def str_to_property(val_in):
+            val = val_in.split('=')
+            return val[0].strip().replace(' ', '_').lower(), val[-1].split('//')[0].strip()
 
-        self._quantities.append(
-            Quantity(
-                'compliance_tensor',
-                r'\[AEL\_COMPLIANCE\_TENSOR\]START([\-\d\.\s]+?)\[AEL\_COMPLIANCE\_TENSOR\]STOP',
-                dtype=np.dtype(np.float64), shape=(6, 6))
-        )
-
-
-class AGLParser(TextParser):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def init_quantities(self):
         self._quantities = [
             Quantity(
-                'thermal_properties',
-                r'\[AGL_THERMAL\_PROPERTIES\_TEMPERATURE\]START\s*.+([\-\d\.\s]+?)'
-                r'\[AGL\_THERMAL\_PROPERTIES\_TEMPERATURE\]STOP',
-                dtype=np.dtype(np.float64)),
+                'property',
+                r'\n *\[(.+)\](.+?=.+)', str_operation=str_to_property, repeats=True),
             Quantity(
-                'energies',
-                r'\[AGL\_ENERGIES\_TEMPERATURE\]START\s*.+([\-\d\.\s]+?)'
-                r'\[AGL\_ENERGIES\_TEMPERATURE\]STOP',
-                dtype=np.dtype(np.float64))
-        ]
+                'section',
+                r'(\[.+?\]START[\s\S]+?\]STOP)',
+                repeats=True, sub_parser=TextParser(quantities=[
+                    Quantity(
+                        'name',
+                        r'\[(.+)\]START', str_operation=lambda x: x.lower(), dtype=str),
+                    Quantity(
+                        'key_value',
+                        r'\n *([^#]\S+)=(\S+)', repeats=True),
+                    Quantity(
+                        'array',
+                        rf'\n *(\d[\s\S]+?\d\s*)\[.+?STOP', dtype=np.dtype(np.float64))]))]
+
+    def parse(self, key=None):
+        super().parse(key)
+        for property in self._results.get('property', []):
+            self._results[property[0]] = property[1]
+        for section in self._results.get('section', []):
+            if section.key_value is not None:
+                result = dict()
+                for key, value in section.get('key_value', []):
+                    result[key] = value
+                self._results[section.name] = result
+            elif section.array is not None:
+                self._results[section.name] = section.array
+
+
+class AflowInParser(AflowOutParser):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def init_quantities(self):
+        super().init_quantities()
+        self._quantities += [
+            Quantity(
+                'aflow_version',
+                r'Stefano Curtarolo \- \(AFLOW V([\d\.]+)\)'),
+            Quantity(
+                'poscar',
+                r'\[VASP_POSCAR_MODE_EXPLICIT\]START\s*([\s\S]+?)\[VASP_POSCAR_MODE_EXPLICIT\]STOP',
+                str_operation=lambda x: x, convert=False, repeats=True),
+            Quantity(
+                'aflow_composition',
+                r'\[AFLOW\] COMPOSITION=(\S+)', sub_parser=TextParser(quantities=[
+                    Quantity('species', r'([A-Z][a-z]*)', repeats=True, dtype=str),
+                    Quantity('composition', r'(\d+)\|', repeats=True, dtype=np.dtype(np.int32))
+                ])
+            )
+        ] + [Quantity(
+            module.lower(),
+            r'\n *\[AFLOW\_%s\]CALC([\s\S]+?)\[AFLOW\] \*' % module, sub_parser=TextParser(quantities=[
+                Quantity(
+                    'parameters',
+                    r'\[AFLOW\_%s\](.+?)=(\S+)' % module, repeats=True)])) for module in [
+                        'AEL', 'AGL', 'APL', 'QHA', 'AAPL']]
+
+    def parse(self, key=None):
+        super().parse(key)
+
+        if self.get('poscar') is not None and self._results.get('geometry') is None:
+            try:
+                atoms = vasp.read_vasp(StringIO(self._results['poscar'][-1]))
+                self._results['cell'] = atoms.get_cell()
+                self._results['geometry'] = atoms.get_cell().cellpar()
+                composition = self._results['aflow_composition']
+                self._results['species'] = composition.species
+                self._results['composition'] = [int(c) for c in composition._results['composition']]
+                self._results['positions_cartesian'] = atoms.get_positions()
+            except Exception:
+                pass
+
+        if self._results.get('loop') is None:
+            self._results['loop'] = [module for module in [
+                'ael', 'agl', 'apl', 'qha', 'aapl'] if module in self._results]
 
 
 class AFLOWParser(FairdiParser):
     def __init__(self):
         super().__init__(
-            name='parsers/aflow', code_name='aflow',
-            code_homepage='http://www.aflowlib.org/',
-            mainfile_contents_re=r'\[AFLOW\] \*{50}',
-            mainfile_name_re=(r'.*/aflow\.a(?:e|g)l\.out$')
-        )
-        self.ael_parser = AELParser()
-        self.agl_parser = AGLParser()
+            name='parsers/aflow', code_name='AFlow', code_homepage='http://www.aflowlib.org/',
+            mainfile_mime_re=r'(application/json)|(text/.*)',
+            mainfile_name_re=r'.*aflowlib\.json.*',  # only the alternative mainfile name should match
+            mainfile_contents_re=(
+                r"^\s*\[AFLOW\] \*+"
+                r"\s*\[AFLOW\]"
+                r"\s*\[AFLOW\]                     .o.        .o88o. oooo"
+                r"\s*\[AFLOW\]                    .888.       888 `` `888"
+                r"\s*\[AFLOW\]                   .8'888.     o888oo   888   .ooooo.  oooo oooo    ooo"
+                r"\s*\[AFLOW\]                  .8' `888.     888     888  d88' `88b  `88. `88.  .8'"
+                r"\s*\[AFLOW\]                 .88ooo8888.    888     888  888   888   `88..]88..8'"
+                r"\s*\[AFLOW\]                .8'     `888.   888     888  888   888    `888'`888'"
+                r"\s*\[AFLOW\]               o88o     o8888o o888o   o888o `Y8bod8P'     `8'  `8'  .in"
+                r"|^\s*\{\"aurl\"\:\"aflowlib\.duke\.edu\:AFLOWDATA"),
+            supported_compressions=['gz', 'bz2', 'xz'], mainfile_alternative=True)
+        self.ael_parser = AflowOutParser()
+        self.agl_parser = AflowOutParser()
+        self.apl_parser = AflowOutParser()
+        self.aflowin_parser = AflowInParser()
         self._metainfo_env = m_env
 
         self._metainfo_map = {
@@ -122,35 +167,74 @@ class AFLOWParser(FairdiParser):
         }
 
     def init_parser(self):
-        self.ael_parser.mainfile = None
-        self.agl_parser.mainfile = None
-        if self.filepath.endswith('aflow.ael.out'):
-            self.ael_parser.mainfile = self.filepath
-            self.ael_parser.logger = self.logger
-        elif self.filepath.endswith('aflow.agl.out'):
-            self.agl_parser.mainfile = self.filepath
-            self.agl_parser.logger = self.logger
+        if '.json' in self.filepath:
+            self.aflow_data = json.load(open(self.filepath))
+        else:
+            self.aflowin_parser.mainfile = self.filepath
+            self.aflow_data = self.aflowin_parser
+
+    def get_aflow_file(self, filename):
+        files = [f for f in os.listdir(self.maindir) if filename in f]
+        if not files:
+            files = ['']
+        return os.path.join(self.maindir, files[0])
+
+    def parse_structures(self, module):
+        try:
+            structures = json.load(open(os.path.join(
+                self.maindir, '%s_energy_structures.json' % module))).get('%s_energy_structures' % module, [])
+        except Exception:
+            structures = []
+
+        for structure in structures:
+            sec_calc = self.archive.run[-1].m_create(Calculation)
+            sec_thermo = sec_calc.m_create(Thermodynamics)
+            if structure.get('energy') is not None:
+                sec_calc.energy = Energy(total=EnergyEntry(value=structure.get('energy') * ureg.eV))
+            if structure.get('pressure') is not None:
+                sec_thermo.pressure = structure.get('pressure') * ureg.kbar
+            if structure.get('stress_tensor') is not None:
+                sec_calc.stress = Stress(total=StressEntry(value=structure.get('stress_tensor') * ureg.kbar))
+            if structure.get('structure') is not None:
+                sec_system = self.archive.run[-1].m_create(System)
+                sec_system.atoms = Atoms()
+                struc = structure.get('structure')
+                sec_system.atoms.labels = [atom.get('name') for atom in struc.get('atoms', [])]
+                sec_system.atoms.concentrations = [atom.get('occupancy') for atom in struc.get('atoms', [])]
+                if struc.get('lattice') is not None:
+                    sec_system.atoms.lattice_vectors = struc.get(
+                        'lattice') * ureg.angstrom * struc.get('scale', 1)
+                positions = [atom.get('position') for atom in struc.get('atoms', [])]
+                if struc.get('coordinates_type', 'direct').lower().startswith('d'):
+                    if sec_system.atoms.lattice_vectors is not None:
+                        positions = np.dot(positions, sec_system.atoms.lattice_vectors)
+                sec_system.atoms.positions = positions
 
     def parse_agl(self):
-        if self.agl_parser.mainfile is None:
-            return
+        sec_run = self.archive.m_create(Run)
+        sec_run.program = Program(
+            name='AFlow', version=self.aflow_data.get('aflow_version', 'unknown'))
 
-        thermal_properties = self.agl_parser.get('thermal_properties')
+        self.parse_structures('AGL')
+
+        self.agl_parser.mainfile = self.get_aflow_file('aflow.agl.out')
+        thermal_properties = self.agl_parser.get('agl_thermal_properties_temperature')
         if thermal_properties is None:
             return
 
         sec_workflow = self.archive.m_create(Workflow)
+        sec_workflow.run_ref = sec_run
         sec_workflow.type = 'debye_model'
         sec_debye = sec_workflow.m_create(DebyeModel)
         sec_thermo = sec_workflow.m_create(WorkflowThermodynamics)
 
         thermal_properties = np.reshape(thermal_properties, (len(thermal_properties) // 9, 9))
         thermal_properties = np.transpose(thermal_properties)
-        energies = self.agl_parser.get('energies')
+        energies = self.agl_parser.get('agl_energies_temperature')
         energies = np.reshape(energies, (len(energies) // 9, 9))
         energies = np.transpose(energies)
 
-        sec_thermo.temperatures = thermal_properties[0] * ureg.K
+        sec_thermo.temperature = thermal_properties[0] * ureg.K
         sec_thermo.gibbs_free_energy = energies[1] * ureg.eV
         sec_thermo.vibrational_free_energy = energies[2] * ureg.meV
         sec_thermo.vibrational_internal_energy = energies[3] * ureg.meV
@@ -165,10 +249,15 @@ class AFLOWParser(FairdiParser):
         sec_debye.bulk_modulus_isothermal = thermal_properties[8] * ureg.GPa
 
     def parse_ael(self):
-        if self.ael_parser.mainfile is None:
-            return
+        sec_run = self.archive.m_create(Run)
+        sec_run.program = Program(
+            name='AFlow', version=self.aflow_data.get('aflow_version', 'unknown'))
 
+        self.parse_structures('AEL')
+
+        self.ael_parser.mainfile = self.get_aflow_file('aflow.ael.out')
         sec_workflow = self.archive.m_create(Workflow)
+        sec_workflow.run_ref = sec_run
         sec_workflow.type = 'elastic'
         sec_elastic = sec_workflow.m_create(Elastic)
         sec_elastic.energy_stress_calculator = 'vasp'
@@ -182,11 +271,112 @@ class AFLOWParser(FairdiParser):
         sec_elastic.n_strains = len(strains)
         sec_elastic.strain_maximum = max(strains) - 1.0
 
-        for key, val in self.ael_parser.items():
-            if val is None:
-                continue
+        for key, val in self.ael_parser.get('ael_results', {}).items():
+            key = key.replace('ael_', '')
             key = self._metainfo_map.get(key, key)
+            if 'modulus' in key or 'pressure' in key:
+                val = val * ureg.GPa
+            elif 'speed' in key:
+                val = val * (ureg.m / ureg.s)
+            elif 'temperature' in key:
+                val = val * ureg.K
             setattr(sec_elastic, key, val)
+
+        if self.ael_parser.ael_stiffness_tensor is not None:
+            sec_elastic.elastic_constants_matrix_second_order = np.reshape(
+                self.ael_parser.ael_stiffness_tensor, (6, 6)) * ureg.GPa
+
+        if self.ael_parser.ael_compliance_tensor is not None:
+            sec_elastic.compliance_matrix_second_order = np.reshape(
+                self.ael_parser.ael_compliance_tensor, (6, 6))
+
+    def parse_apl(self):
+        sec_run = self.archive.m_create(Run)
+        sec_run.program = Program(
+            name='AFlow', version=self.aflow_data.get('aflow_version', 'unknown'))
+        sec_scc = sec_run.m_create(Calculation)
+
+        try:
+            dos = np.transpose(
+                np.loadtxt(self.get_aflow_file('flow.apl.phonon_dos.out.xz')))
+        except Exception:
+            dos = None
+
+        if dos is not None:
+            sec_dos = sec_scc.m_create(Dos, Calculation.dos_phonon)
+            sec_dos.energies = dos[2] * ureg.millielectron_volt
+            sec_dos.total.append(DosValues(value=dos[3] * (1 / ureg.millielectron_volt)))
+
+        try:
+            kpoints = np.transpose(
+                np.loadtxt(self.get_aflow_file('aflow.apl.hskpoints.out.xz')))
+            n_kpoints = int(max(kpoints[3])) + 1
+            kpoints = kpoints[:3]
+            kpoints = np.reshape(kpoints, (3, len(kpoints[0]) // n_kpoints, n_kpoints))
+            kpoints = np.transpose(kpoints, axes=(1, 2, 0))
+
+            bandstructure = np.transpose(
+                np.loadtxt(self.get_aflow_file('aflow.apl.phonon_dispersion.out.xz')))
+            bandstructure = bandstructure[2:]
+            bandstructure = np.reshape(bandstructure, (
+                len(bandstructure), len(bandstructure[0]) // n_kpoints, n_kpoints))
+            bandstructure = np.transpose(bandstructure, axes=(1, 2, 0))
+        except Exception:
+            kpoints = None
+
+        if kpoints is not None:
+            sec_bandstructure = sec_scc.m_create(BandStructure, Calculation.band_structure_phonon)
+            for n_segment in range(len(kpoints)):
+                sec_segment = sec_bandstructure.m_create(BandEnergies)
+                sec_segment.kpoints = kpoints[n_segment]
+                sec_segment.energies = np.reshape(
+                    bandstructure[n_segment], (1, *np.shape(bandstructure[n_segment]))) * ureg.millielectron_volt
+
+        self.apl_parser.mainfile = self.get_aflow_file('aflow.apl.thermodynamic_properties.out')
+
+        sec_workflow = self.archive.m_create(Workflow)
+        sec_workflow.type = 'phonon'
+        sec_workflow.run_ref = sec_run
+
+        sec_phonon = sec_workflow.m_create(Phonon)
+        sec_phonon.force_calculator = 'vasp'
+        mesh = self.aflowin_parser.get('aflow_apl_dosmesh')
+        if mesh is not None:
+            try:
+                cell = Cell.fromcellpar(self.aflowin_parser.geometry)
+                sec_phonon.mesh_density = np.product([int(m) for m in mesh.split('x')]) / cell.volume
+            except Exception:
+                pass
+
+        self.apl_parser.mainfile = self.get_aflow_file('aflow.apl.group_velocities.out')
+        group_velocity = self.apl_parser.get('apl_group_velocity')
+        if group_velocity is not None:
+            try:
+                qpoints = self.apl_parser.apl_qpoints
+                qpoints = np.reshape(qpoints, (len(qpoints) // 4, 4))
+                sec_phonon.qpoints = np.transpose(np.transpose(qpoints)[1:])
+                group_velocity = np.reshape(
+                    group_velocity, (len(qpoints), len(group_velocity) // len(qpoints)))
+                group_velocity = np.transpose(np.transpose(group_velocity)[1:])
+                sec_phonon.group_velocity = np.reshape(group_velocity, (
+                    len(group_velocity), len(group_velocity[0]) // 3, 3)) * ureg.kilometer / ureg.second
+            except Exception:
+                pass
+
+        self.apl_parser.mainfile = self.get_aflow_file('aflow.apl.thermodynamic_properties.out.xz')
+        apl_thermo = self.apl_parser.get('apl_thermo')
+        if apl_thermo is not None:
+            apl_thermo = np.transpose(np.reshape(apl_thermo, (len(apl_thermo) // 6, 6)))
+            sec_thermo = sec_workflow.m_create(WorkflowThermodynamics)
+            sec_thermo.temperature = apl_thermo[0] * ureg.kelvin
+            sec_thermo.internal_energy = apl_thermo[2] * ureg.millielectron_volt
+            sec_thermo.helmholtz_free_energy = apl_thermo[3] * ureg.millielectron_volt
+            sec_thermo.entropy = apl_thermo[4] * ureg.boltzmann_constant
+            sec_thermo.heat_capacity_c_v = apl_thermo[5] * ureg.boltzmann_constant
+
+        # TODO parse systems for each displacements
+
+        # TODO parse displacements, force constants, dynamical matrix
 
     def parse(self, filepath, archive, logger):
         self.filepath = os.path.abspath(filepath)
@@ -196,15 +386,9 @@ class AFLOWParser(FairdiParser):
 
         self.init_parser()
 
-        # load the aflow metadata from aflowlib.json
-        try:
-            self.aflow_data = json.load(open(os.path.join(self.maindir, 'aflowlib.json')))
-        except Exception:
-            self.aflow_data = dict()
-
         sec_run = self.archive.m_create(Run)
         sec_run.program = Program(
-            name='aflow', version=self.aflow_data.get('aflow_version', 'unknown'))
+            name='AFlow', version=self.aflow_data.get('aflow_version', 'unknown'))
 
         # parse run metadata
         run_quantities = ['aurl', 'auid', 'data_api', 'data_source', 'loop']
@@ -214,15 +398,13 @@ class AFLOWParser(FairdiParser):
                 setattr(sec_run, 'x_aflow_%s' % key, val)
 
         # TODO The OUTCAR file will be read by the vasp parser and so the complete
-        # metadata for both system and method should be filled in by vasp parser. However,
-        # we need a way to reference this as well as for the deformed structures which are
-        # in ARUN.AEL_*
+        # metadata for both system and method should be filled in by vasp parser.
         # parse structure from aflow_data
         sec_system = sec_run.m_create(System)
         sec_system.atoms = Atoms()
         lattice_parameters = self.aflow_data.get('geometry')
         if lattice_parameters is not None:
-            cell = Cell.fromcellpar(lattice_parameters)
+            cell = self.aflow_data.get('cell', Cell.fromcellpar(lattice_parameters))
             sec_system.atoms.lattice_vectors = cell.array * ureg.angstrom
             sec_system.atoms.periodic = [True, True, True]
         species = self.aflow_data.get('species', [])
@@ -264,6 +446,8 @@ class AFLOWParser(FairdiParser):
         for key in system_quantities:
             val = self.aflow_data.get(key)
             if val is not None:
+                if 'Wyckoff' in key:
+                    val = np.array(val, dtype=object)
                 setattr(sec_system, 'x_aflow_%s' % key, val)
 
         # parse method metadata from self.aflow_data
@@ -292,7 +476,7 @@ class AFLOWParser(FairdiParser):
         if self.aflow_data.get('enthalpy_cell') is not None:
             sec_thermo.enthalpy = self.aflow_data['enthalpy_cell'] * ureg.eV
         if self.aflow_data.get('entropy_cell') is not None:
-            sec_scc.entropy = self.aflow_data['entropy_cell'] * ureg.eV / ureg.K
+            sec_thermo.entropy = self.aflow_data['entropy_cell'] * ureg.eV / ureg.K
         if self.aflow_data.get('calculation_time') is not None:
             sec_scc.time_calculation = self.aflow_data['calculation_time'] * ureg.s
         calculation_quantities = [
@@ -318,5 +502,10 @@ class AFLOWParser(FairdiParser):
             if val is not None:
                 setattr(sec_scc, 'x_aflow_%s' % key, val)
 
-        self.parse_ael()
-        self.parse_agl()
+        for module in self.aflow_data.get('loop', []):
+            if module == 'ael':
+                self.parse_ael()
+            elif module == 'agl':
+                self.parse_agl()
+            elif module == 'apl':
+                self.parse_apl()
